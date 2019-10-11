@@ -27,10 +27,89 @@ from flask import Blueprint, current_app, make_response, render_template, url_fo
 from redis import Redis, from_url
 from redis.sentinel import Sentinel
 from rq import (Queue, Worker, cancel_job, pop_connection,
-                push_connection, requeue_job, VERSION as rq_version)
+                push_connection, requeue_job, VERSION as rq_version, get_current_connection)
 from rq.job import Job
 from .legacy_config import upgrade_config
-from .version import VERSION as rq_dashboard_version
+from rq.compat import as_text
+from rq.exceptions import NoSuchJobError
+
+
+class SchedulerQueue(object):
+    job_class = Job
+    scheduler_queue_namespace_prefix = 'rq:scheduler:'
+    scheduler_queues_keys = 'rq:queues'
+
+    def __init__(self, name='scheduled_jobs'):
+        self.connection = get_current_connection()
+        prefix = self.scheduler_queue_namespace_prefix
+        self.name = name
+        self._key = '{0}{1}'.format(prefix, name)
+
+    def __iter__(self):
+        yield self
+
+    @property
+    def count(self):
+        """Returns a count of all messages in the scheduler queue."""
+        return self.connection.zcard(self.key)
+
+    @property
+    def key(self):
+        """Returns the Redis key for this Scheduler Queue."""
+        return self._key
+
+    @classmethod
+    def get(cls, name):
+        return cls(name)
+
+    def fetch_job(self, job_id):
+        try:
+            job = self.job_class.fetch(job_id, connection=self.connection)
+        except NoSuchJobError:
+            self.remove(job_id)
+        else:
+            if job.origin == self.name or self.name == 'scheduled_jobs':
+                return job
+
+    def get_job_ids(self, offset=0, length=-1):
+        """Returns a slice of job IDs in the Scheduler Queue."""
+        start = offset
+        if length >= 0:
+            end = offset + (length - 1)
+        else:
+            end = length
+        return [as_text(job_id) for job_id in
+                self.connection.zrange(self.key, start, end)]
+
+    def get_jobs(self, offset=0, length=-1):
+        """Returns a slice of jobs in the scheduler queue."""
+        job_ids = self.get_job_ids(offset, length)
+        return compact([self.fetch_job(job_id) for job_id in job_ids])
+
+    def remove(self, job_or_id, pipeline=None):
+        """Removes Job from queue, accepts either a Job instance or ID."""
+        job_id = job_or_id.id if isinstance(job_or_id, self.job_class) else job_or_id
+
+        if pipeline is not None:
+            pipeline.zrem(self.key, job_id)
+            return
+
+        return self.connection.zrem(self.key, job_id)
+
+    def empty(self):
+        """Removes all messages on the scheduler queue."""
+        job_ids = self.get_job_ids()
+        job_redis_keys = []
+        for job_id in job_ids:
+            job_redis_key = '{}{}'.format(self.job_class.redis_job_namespace_prefix, job_id)
+            job_redis_keys.append(job_redis_key)
+        self.connection.delete(*job_redis_keys)
+        self.connection.zremrangebyrank(self.scheduler_queues_keys, 0, -1)
+        return len(job_redis_keys)
+
+
+def compact(lst):
+    return [item for item in lst if item is not None]
 
 
 def get_all_queues():
@@ -40,6 +119,10 @@ def get_all_queues():
     Redefined in compat module to also return magic failed queue.
     """
     return Queue.all()
+
+
+def get_scheduler_queue():
+    return SchedulerQueue.get('scheduled_jobs')
 
 
 try:
@@ -58,6 +141,8 @@ blueprint = Blueprint(
 def get_queue(queue_name):
     if queue_name == 'failed':
         return get_failed_queue()
+    elif queue_name == 'scheduled_jobs':
+        return SchedulerQueue()
     else:
         return Queue(queue_name)
 
@@ -195,7 +280,12 @@ def cancel_job_view(job_id):
     if current_app.config.get('RQ_DASHBOARD_DELETE_JOBS', False):
         Job.fetch(job_id).delete()
     else:
-        cancel_job(job_id)
+        sq = SchedulerQueue()
+        scheduled_jobs = sq.get_job_ids()
+        if job_id in scheduled_jobs:
+            sq.connection.zrem('{}scheduled_jobs'.format(sq.scheduler_queue_namespace_prefix), job_id)
+        else:
+            cancel_job(job_id)
     return dict(status='OK')
 
 
@@ -268,7 +358,8 @@ def list_instances():
 @jsonify
 def list_queues():
     queues = serialize_queues(sorted(get_all_queues()))
-    return dict(queues=queues)
+    scheduler = serialize_queues(get_scheduler_queue())
+    return dict(queues=queues + scheduler)
 
 
 @blueprint.route('/jobs/<queue_name>/<page>.json')
